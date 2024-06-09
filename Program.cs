@@ -26,7 +26,7 @@ namespace AzureDevOpsNuGetUpdater
       // Azure DevOps Configurations
       var azureDevOpsUrl = "https://dev.azure.com/papstio";
       var projectName = "Sunbelt%20SCM";
-      var personalAccessToken = "pcno324wqdsdt66m5dkjmj5oymcbkrh3iqcx6c4cpl57o62ut4oq";
+      var personalAccessToken = "";
 
 
       var azureDevOpsUri = new Uri(azureDevOpsUrl);
@@ -57,7 +57,7 @@ namespace AzureDevOpsNuGetUpdater
         var directoryPackagesProps = items.FirstOrDefault(i => i.Path.EndsWith("Directory.Packages.props"));
 
         var packageReferences = new List<PackageReference>();
-
+        
         foreach (var csproj in csprojFiles)
         {
           var content = await gitClient.GetItemContentAsync(repo.Id, csproj.Path);
@@ -77,7 +77,7 @@ namespace AzureDevOpsNuGetUpdater
 
         var updates = await CheckForUpdates(packageReferences, packageSourceUris);
 
-        if (updates.Any())
+        if (updates.Count != 0)
         {
           AnsiConsole.Markup("[bold yellow]Updates found![/]");
           var updateSelection = AnsiConsole.Prompt(
@@ -90,9 +90,11 @@ namespace AzureDevOpsNuGetUpdater
               .AddChoices(updates)
           );
 
-          if (updateSelection.Any())
+          updateSelection = updates;
+
+          if (updateSelection.Count != 0)
           {
-            await CreatePullRequestWithUpdates(gitClient, repo, updateSelection);
+            await CreatePullRequestWithUpdates(gitClient, repo, updateSelection, csprojFiles, directoryPackagesProps);
           }
         }
         else
@@ -161,23 +163,115 @@ namespace AzureDevOpsNuGetUpdater
       return updates;
     }
 
-    static async Task CreatePullRequestWithUpdates(GitHttpClient client, GitRepository repo, List<PackageUpdate> updates)
+    static async Task CreatePullRequestWithUpdates(GitHttpClient client, GitRepository repo, List<PackageUpdate> updates, List<GitItem> csprojFiles, GitItem? centralPackageManagement)
     {
       // get latest commit
-      List<GitRef> refs = await client.GetRefsAsync(repo.Id, filter: repo.DefaultBranch).ConfigureAwait(false);
-      string latestCommitId = refs.First().ObjectId;
-      GitRefUpdate newBranch = new()
-      {
-        Name = $"refs/heads/nugetupdate-{DateTimeOffset.Now:yyyy-MM-dd}",
-        OldObjectId = latestCommitId,
-        NewObjectId = latestCommitId
-      };
-      var branchCreation = await client.UpdateRefsAsync([newBranch], repo.Id);
+      List<GitRef> refs = await client.GetRefsAsync(repo.Id).ConfigureAwait(false);
+      string latestCommitId = refs.First(r => r.Name == repo.DefaultBranch).ObjectId;
       
-      var change = new GitChange()
+      List<GitChange> changes = [];
+      foreach (var csproj in csprojFiles)
       {
-        ChangeType = VersionControlChangeType.Edit,
-        Item = new GitItem() {Path = }
+        var stream = await client.GetItemContentAsync(repo.ProjectReference.Id, repo.Id, csproj.Path).ConfigureAwait(false);
+        XDocument xDoc = XDocument.Load(stream);
+        bool hasChanges = false;
+        foreach (var node in xDoc.XPathSelectElements("//PackageReference"))
+        {
+          PackageUpdate? update = updates.Find(u => u.Id == node.Attribute("Include")?.Value);
+          if (update is null || node.Attribute("Version") is null || node.Attribute("Version")?.Value == update.LatestVersion)
+          {
+            continue;
+          }
+
+          hasChanges = true;
+          node.Attribute("Version")!.Value = update.LatestVersion;
+        }
+
+        if (hasChanges)
+        {
+          changes.Add(new GitChange()
+          {
+            ChangeType = VersionControlChangeType.Edit,
+            Item = csproj,
+            NewContent = new ItemContent()
+            {
+              Content = xDoc.ToString(),
+              ContentType = ItemContentType.RawText
+            }
+          });
+        }
+      }
+
+      if (centralPackageManagement is not null)
+      {
+        var stream = await client.GetItemContentAsync(repo.ProjectReference.Id, repo.Id, centralPackageManagement.Path).ConfigureAwait(false);
+        XDocument xDoc = XDocument.Load(stream);
+        bool hasChanges = false;
+        foreach (var node in xDoc.XPathSelectElements("//PackageReference"))
+        {
+          PackageUpdate? update = updates.Find(u => u.Id == node.Attribute("Include")?.Value);
+          if (update is null || node.Attribute("Version") is null ||
+              node.Attribute("Version")?.Value == update.LatestVersion)
+          {
+            continue;
+          }
+
+          hasChanges = true;
+          node.Attribute("Version")!.Value = update.LatestVersion;
+        }
+
+        if (hasChanges)
+        {
+          changes.Add(new GitChange()
+          {
+            ChangeType = VersionControlChangeType.Edit,
+            Item = centralPackageManagement,
+            NewContent = new()
+            {
+              Content = xDoc.ToString(),
+              ContentType = ItemContentType.RawText
+            }
+          });
+        }
+      }
+
+      if (changes.Count > 0)
+      {
+        GitRefUpdate newBranch = new()
+        {
+          Name = $"refs/heads/dependency/update-{DateTimeOffset.Now:yyyy-MM-dd}",
+          OldObjectId = latestCommitId,
+          NewObjectId = latestCommitId
+        };
+        var branchCreation = await client.UpdateRefsAsync([newBranch], repo.Id);
+        var newCommit = new GitCommitRef
+        {
+          Comment = "Updating Dependencies",
+          Changes = changes,
+          
+        };
+
+        var push = new GitPush
+        {
+          RefUpdates = [ new GitRefUpdate()
+          {
+            Name = newBranch.Name,
+            OldObjectId = newBranch.NewObjectId,
+            NewObjectId = Guid.NewGuid().ToString()
+          } ],
+          Commits = [newCommit ]
+        };
+
+        var gitPush = await client.CreatePushAsync(push, repo.Id);
+        var pr = new GitPullRequest
+        {
+          Title = "Add new file",
+          Description = "This PR adds a new file.",
+          SourceRefName = $"refs/heads/{newBranch.Name}",
+          TargetRefName = "refs/heads/main",
+          // Reviewers = new IdentityRefWithVote[] { new IdentityRef { DisplayName = "ReviewerName" } }
+        };
+        await client.CreatePullRequestAsync(pr, repo.Id, repo.ProjectReference.Name);
       }
     }
   }
@@ -186,5 +280,4 @@ namespace AzureDevOpsNuGetUpdater
 
   public record PackageUpdate(string Id, string CurrentVersion, string LatestVersion);
   
-  public record RepositoryInfo(string Id, string Branch, Repository)
 }
